@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 내장 WireGuard 터널 빌드
+        shell: pwsh
+        # Go와 wireguard-nt는 스크립트가 wireguard-windows 태그의 build.bat에 적힌
+        # 버전/해시 그대로 받아온다. cgo용 gcc는 러너에 기본 포함된 mingw-w64를 쓴다.
+        run: ./scripts/build_tunnel.ps1
+
+      - name: 의존성 설치
+        env:
+          # PyPI 휠에 들어있는 미리 빌드된 부트로더는 수많은 exe가 공유해 백신
+          # 머신러닝 휴리스틱(Wacatac.B!ml)에 오탐되기 쉽다 — 소스(sdist)에서
+          # 부트로더를 직접 컴파일해 설치한다(러너에 MSVC가 기본 포함).
+          PYINSTALLER_COMPILE_BOOTLOADER: '1'
+        run: |
+          pip install --no-binary=pyinstaller pyinstaller
+          pip install -r requirements.txt
+
+      - name: 버전 정보 반영
+        run: |
+          "VERSION = '${{ github.ref_name }}'.lstrip('v')" | Out-File -Encoding utf8 app/version.py
+          python .github/scripts/make_version_file.py "${{ github.ref_name }}" "WireWOLPC_${{ github.ref_name }}.exe" "WireWOL PC remote" version_info.txt
+
+      - name: exe 빌드
+        run: |
+          python -m PyInstaller `
+            --onefile `
+            --windowed `
+            --uac-admin `
+            --version-file "version_info.txt" `
+            --icon "assets/app_icon.ico" `
+            --add-data "assets/app_icon.ico;assets" `
+            --add-binary "vendor/amd64/tunnel.dll;tunnel" `
+            --add-binary "vendor/amd64/wireguard.dll;tunnel" `
+            --add-data "vendor/amd64/wirewol-tunnel-host.exe;tunnel" `
+            --name "WireWOLPC_${{ github.ref_name }}" `
+            "wirewolpc.pyw"
+
+      - name: exe 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/WireWOLPC_${{ github.ref_name }}.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: exe 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: dist
+
+      - name: 같은 부버전 기존 릴리즈 삭제
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          # v1.2.3 → 1.2 (major.minor 추출)
+          MINOR=$(echo "$TAG" | sed 's/^v//' | cut -d. -f1-2)
+
+          gh release list --repo ${{ github.repository }} --limit 100 \
+            --json tagName --jq '.[].tagName' | while read t; do
+            TM=$(echo "$t" | sed 's/^v//' | cut -d. -f1-2)
+            if [ "$TM" = "$MINOR" ] && [ "$t" != "$TAG" ]; then
+              echo "기존 릴리즈 삭제: $t"
+              gh release delete "$t" --yes --repo ${{ github.repository }}
+            fi
+          done
+
+      - name: 릴리즈 생성 및 exe 첨부
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/WireWOLPC_${{ github.ref_name }}.exe

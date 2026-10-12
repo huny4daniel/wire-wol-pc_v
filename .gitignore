@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+version_info.txt
+# scripts/build_tunnel.ps1이 만드는 빌드 산출물(tunnel.dll, wireguard.dll, 서비스 호스트)
+vendor/

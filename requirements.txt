@@ -1,0 +1,5 @@
+PyQt5>=5.15
+requests>=2.31
+pywin32>=306
+opencv-python>=4.9
+cryptography>=42
