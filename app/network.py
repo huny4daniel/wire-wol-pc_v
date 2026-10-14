@@ -2,8 +2,11 @@
 직접 도달 여부 탐지(android NetworkProbe), 네트워크 연결 유무(android
 hasAnyNetwork)."""
 import ctypes
+import ipaddress
 import re
 import socket
+
+import psutil
 
 _MAC_SPLIT_RE = re.compile(r'[:\-]')
 _PROBE_TIMEOUT_SECONDS = 1.5
@@ -25,6 +28,31 @@ def is_reachable_directly(host: str, port, timeout: float = _PROBE_TIMEOUT_SECON
             return True
     except OSError:
         return False
+
+
+def tunnel_routes(host: str, tunnel_name: str) -> list[str]:
+    """내장 터널이 맡을 주소(AllowedIPs) — PC의 사설 /24 대역(지정 브로드캐스트 WOL 포함).
+    이 PC가 이미 그 대역 안에 있으면 빈 목록: 집 안이면 PC에 바로 닿으니 터널이 필요 없고,
+    우연히 같은 대역을 쓰는 다른 망이면 터널로 보내 봐야 그 망의 기기와 충돌만 한다 — 그래서
+    집 안에서는 PC가 꺼져 있어도 터널을 켜지 않는다. 대역이 이 PC의 망과 겹치면 PC 주소(/32)만.
+    remote-file-manager_v의 tunnelRoutes와 같은 규칙. 이름 풀이가 있으니 백그라운드에서 호출할 것."""
+    try:
+        ip = ipaddress.IPv4Address(socket.gethostbyname(host))
+    except (OSError, ValueError):
+        return []
+    local = []
+    for name, addrs in psutil.net_if_addrs().items():
+        if name == tunnel_name:
+            continue
+        for a in addrs:
+            if a.family == socket.AF_INET and a.netmask and not a.address.startswith('127.'):
+                local.append(ipaddress.IPv4Interface(f'{a.address}/{a.netmask}'))
+    if any(ip in iface.network for iface in local):
+        return []
+    net24 = ipaddress.IPv4Network(f'{ip}/24', strict=False)
+    if ip.is_private and not any(iface.ip in net24 for iface in local):
+        return [str(net24)]
+    return [f'{ip}/32']
 
 
 def has_any_network() -> bool:

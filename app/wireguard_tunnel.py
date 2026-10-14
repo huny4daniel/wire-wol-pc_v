@@ -51,8 +51,40 @@ _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 _lock = threading.Lock()
 
 
+# 지금 켜 둔 터널이 맡은 주소 — 망이 바뀌어 맡을 주소가 달라졌는지 비교하는 데 쓴다.
+active_routes: list[str] | None = None
+
+
 class WireGuardError(Exception):
     pass
+
+
+def split_conf(conf_text: str, allowed_ips: list[str]) -> str:
+    """터널이 집 PC로 가는 트래픽만 맡도록 .conf를 고친다(저장된 원본은 그대로).
+    첫 [Peer]의 AllowedIPs를 allowed_ips로 바꾸고 나머지 피어의 AllowedIPs는 뺀다 — 0.0.0.0/0이
+    없으니 wireguard-windows의 kill switch(터널 밖 통신 차단)도 켜지지 않아, 터널이 막혀도 이 PC의
+    인터넷은 끊기지 않는다. [Interface]의 DNS도 뺀다 — 터널 DNS(보통 집 공유기)는 터널이 막히면
+    이름 풀이 전체를 막는다. remote-file-manager_v의 splitConf와 같다."""
+    section = ''
+    peers = 0
+    out = []
+    for line in conf_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('[') and ']' in stripped:
+            section = stripped[1:stripped.index(']')].strip().lower()
+            out.append(line)
+            if section == 'peer':
+                peers += 1
+                if peers == 1:
+                    out.append(f'AllowedIPs = {", ".join(allowed_ips)}')
+            continue
+        key = stripped.split('=', 1)[0].strip().lower()
+        if section == 'peer' and key == 'allowedips':
+            continue
+        if section == 'interface' and key == 'dns':
+            continue
+        out.append(line)
+    return '\n'.join(out)
 
 
 def _bundled_dir() -> str:
@@ -159,9 +191,10 @@ def _remove_service(scm):
         time.sleep(0.2)
 
 
-def bring_up(conf_text: str):
-    """터널 서비스를 만들어 띄운다. 실패 시 WireGuardError. 백그라운드 스레드에서
-    호출할 것(서비스 기동을 최대 수십 초 기다린다)."""
+def bring_up(conf_text: str, allowed_ips: list[str]):
+    """터널 서비스를 만들어 띄운다(allowed_ips로 가는 트래픽만 맡음). 실패 시 WireGuardError.
+    백그라운드 스레드에서 호출할 것(서비스 기동을 최대 수십 초 기다린다)."""
+    global active_routes
     with _lock:
         # 이미 떠 있으면 다시 올리지 않는다(버튼과 자동 연결이 겹치는 경우).
         if is_up():
@@ -171,7 +204,7 @@ def bring_up(conf_text: str):
             _remove_service(scm)
             _prepare_install_dir()
             with open(_CONF_PATH, 'w', encoding='utf-8', newline='\n') as f:
-                f.write(conf_text.strip() + '\n')
+                f.write(split_conf(conf_text, allowed_ips).strip() + '\n')
             host_exe = os.path.join(INSTALL_DIR, _HOST_EXE)
             try:
                 service = win32service.CreateService(
@@ -201,6 +234,7 @@ def bring_up(conf_text: str):
                 # (서비스 종류, 상태, 허용 제어, Win32 종료 코드, 서비스 고유 종료 코드, ...)
                 code = status[4] if status[3] == winerror.ERROR_SERVICE_SPECIFIC_ERROR else status[3]
                 raise WireGuardError(f'WireGuard 터널을 시작할 수 없습니다 (오류 코드 {code}) — 설정 내용을 확인해주세요')
+            active_routes = list(allowed_ips)
         finally:
             # 설정은 서비스가 시작할 때 한 번만 읽는다 — 개인키가 담긴 파일을
             # 디스크에 남겨두지 않는다.
@@ -212,7 +246,9 @@ def bring_up(conf_text: str):
 
 
 def bring_down():
+    global active_routes
     with _lock:
+        active_routes = None
         scm = _open_scm()
         try:
             _remove_service(scm)

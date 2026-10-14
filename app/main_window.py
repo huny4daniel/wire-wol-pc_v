@@ -41,6 +41,7 @@ WAKE_RETRY_TIMEOUT_SECONDS = 30
 TUNNEL_SETTLE_PROBE_TIMEOUT_SECONDS = 3.0
 SHUTDOWN_SNACKBAR_MS = 10_000
 AUTO_SHUTDOWN_WAIT_TIMEOUT_SECONDS = 10 * 60
+NETWORK_WATCH_INTERVAL_MS = 15_000
 
 STATUS_POWER_CHECKING = 'PC 상태: 확인 중…'
 STATUS_POWER_ON = 'PC 상태: 켜짐'
@@ -87,6 +88,12 @@ class MainWindow(QWidget):
         self._wg_off_watch_timer = self._single_shot_timer(self._wireguard_off_watch_tick)
         self._wg_off_watch_in_flight = False
         self._wg_off_watch_generation = 0
+        # 터널이 켜진 채로 망이 바뀌면(예: 집에 들어옴) 터널이 맡을 주소를 다시 맞춘다 —
+        # 최소화해도 멈추지 않는다.
+        self._network_watch_timer = QTimer(self)
+        self._network_watch_timer.timeout.connect(self._network_watch_tick)
+        self._network_watch_timer.start(NETWORK_WATCH_INTERVAL_MS)
+        self._network_watch_in_flight = False
 
         self._closing = False
 
@@ -348,23 +355,30 @@ class MainWindow(QWidget):
 
     def _ensure_connectivity(self, on_ready):
         """WireGuard가 없거나 이미 켜져 있으면 곧바로 on_ready를 실행한다. 그 외엔
-        WireGuard 없이 컴패니언 포트로 짧게(1.5초) 직접 연결을 찔러봐서 지금 집
-        안(또는 이미 도달 가능한 상태)인지 확인하고, 안 되면(외부) 와이어가드를
-        자동으로 켠 뒤 진행한다 — 매번 손으로 와이어가드부터 켤 필요가 없다."""
+        이 PC가 대상 PC와 같은 대역에 있는지(집 안 — PC가 꺼져 있어도 판단된다), 아니면
+        WireGuard 없이 컴패니언 포트로 짧게(1.5초) 직접 연결을 찔러봐서 이미 도달 가능한
+        상태인지 확인하고, 둘 다 아니면(외부) 와이어가드를 자동으로 켠 뒤 진행한다 —
+        매번 손으로 와이어가드부터 켤 필요가 없다."""
         conf = self.config.load_wireguard_conf()
         pairing = self.config.load_pairing()
         if not conf or wireguard_tunnel.is_up() or not pairing:
             on_ready()
             return
 
-        def on_probe_done(reachable, _error):
-            if reachable:
+        def check():
+            routes = network.tunnel_routes(pairing['host'], wireguard_tunnel.TUNNEL_NAME)
+            if not routes or network.is_reachable_directly(pairing['host'], pairing['port']):
+                return None
+            return routes
+
+        def on_check_done(routes, _error):
+            if not routes:
                 on_ready()
                 return
             self._toast_short('PC에 직접 연결할 수 없어 WireGuard를 자동으로 켭니다…')
 
             def bring_up_and_wait():
-                wireguard_tunnel.bring_up(conf)
+                wireguard_tunnel.bring_up(conf, routes)
                 self._wait_for_tunnel_ready(pairing)
 
             def on_up_done(_result, error):
@@ -375,7 +389,7 @@ class MainWindow(QWidget):
 
             run_async(bring_up_and_wait, on_up_done)
 
-        run_async(lambda: network.is_reachable_directly(pairing['host'], pairing['port']), on_probe_done)
+        run_async(check, on_check_done)
 
     @staticmethod
     def _wait_for_tunnel_ready(pairing):
@@ -709,14 +723,55 @@ class MainWindow(QWidget):
         if wireguard_tunnel.is_up():
             self._update_status()
             return
+        # 터널은 PC 대역만 맡으므로 PC가 등록돼 있어야 한다.
+        pairing = self.config.load_pairing()
+        if not pairing:
+            self._toast_long('먼저 설정에서 PC를 등록해주세요')
+            return
         self._toast_short('VPN 연결 중…')
 
-        def on_done(_result, error):
+        def bring_up() -> bool:
+            routes = network.tunnel_routes(pairing['host'], wireguard_tunnel.TUNNEL_NAME)
+            if not routes:
+                return False
+            wireguard_tunnel.bring_up(conf, routes)
+            return True
+
+        def on_done(started, error):
             if error is not None:
                 self._toast_long(f'VPN 연결에 실패했습니다: {error}')
+            elif not started:
+                self._toast_long('PC와 같은 네트워크에 있어 와이어가드가 필요 없습니다')
             self._update_status()
 
-        run_async(lambda: wireguard_tunnel.bring_up(conf), on_done)
+        run_async(bring_up, on_done)
+
+    def _network_watch_tick(self):
+        """터널이 켜진 채로 망이 바뀌어 맡을 주소가 달라지면 다시 맞춘다 — 집에 들어와 PC와
+        같은 대역이 되면 끈다(켜 둔 채면 PC 접속이 공유기를 한 바퀴 돌아야 한다). 앱을 다시
+        켰을 때 남아 있던 터널(맡은 주소를 모름)도 새로 맞춘다."""
+        conf = self.config.load_wireguard_conf()
+        pairing = self.config.load_pairing()
+        if (self._closing or self._network_watch_in_flight or not conf or not pairing
+                or not wireguard_tunnel.is_up()):
+            return
+        self._network_watch_in_flight = True
+
+        def work() -> bool:
+            routes = network.tunnel_routes(pairing['host'], wireguard_tunnel.TUNNEL_NAME)
+            if routes == wireguard_tunnel.active_routes:
+                return False
+            wireguard_tunnel.bring_down()
+            if routes:
+                wireguard_tunnel.bring_up(conf, routes)
+            return True
+
+        def on_done(changed, error):
+            self._network_watch_in_flight = False
+            if changed or error is not None:
+                self._refresh_wireguard_status()
+
+        run_async(work, on_done)
 
     def _on_wireguard_off_clicked(self):
         self._clear_wireguard_off_watch()
